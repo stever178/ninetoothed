@@ -580,6 +580,7 @@ class CodeGenerator(ast.NodeTransformer):
 
     def _generate_grid(self):
         num_elements = functools.reduce(lambda x, y: x * y, self._args[0].shape)
+        num_elements = _subtle_simplify(num_elements)
 
         grid = ast.parse(f"lambda meta: ({num_elements},)", mode="eval").body
 
@@ -827,8 +828,13 @@ class CodeGenerator(ast.NodeTransformer):
     @staticmethod
     def _unravel_index(index, shape):
         indices = []
+        new_shape = []
 
-        for stride in Tensor(shape=shape).strides:
+        for i in range(len(shape)):
+            out_symbol = _subtle_simplify(shape[i])
+            new_shape.append(out_symbol)
+
+        for stride in Tensor(shape=new_shape).strides:
             indices.append(index // stride)
             index %= stride
 
@@ -1261,3 +1267,9 @@ def _run_pseudo_add_kernel(block_size):
     c.data_ptr = data_ptr
 
     kernel[(1,)](a, b, c, num_elements, block_size)
+
+
+def _subtle_simplify(symbol):
+    symbol_expr = sympy.simplify(str(symbol))
+    new_expr = str(symbol_expr).replace("floor((", "((").replace(")/", ")//")
+    return Symbol(new_expr)
