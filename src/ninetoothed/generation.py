@@ -7,6 +7,7 @@ import inspect
 import itertools
 import json
 import math
+import operator
 import os
 import pathlib
 import random
@@ -1270,6 +1271,97 @@ def _run_pseudo_add_kernel(block_size):
 
 
 def _subtle_simplify(symbol):
-    symbol_expr = sympy.simplify(str(symbol))
-    new_expr = str(symbol_expr).replace("floor((", "((").replace(")/", ")//")
-    return Symbol(new_expr)
+    expr_str = str(symbol)
+    simplified_str = _simplify_add_sub(expr_str)
+    return Symbol(simplified_str)
+
+
+def _simplify_add_sub(expr_str):
+    tree = ast.parse(expr_str, mode="eval")
+
+    def simplify(node):
+        if isinstance(node, ast.BinOp):
+            left = simplify(node.left)
+            right = simplify(node.right)
+
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+                    op_func = (
+                        operator.add if isinstance(node.op, ast.Add) else operator.sub
+                    )
+                    return ast.Constant(value=op_func(left.value, right.value))
+
+                terms = flatten_add_sub(ast.BinOp(left=left, op=node.op, right=right))
+                simplified_terms = combine_constants(terms)
+                return rebuild_ast_from_terms(simplified_terms)
+
+            elif isinstance(node.op, ast.Mult):
+                if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+                    return ast.Constant(value=left.value * right.value)
+                return ast.BinOp(left=left, op=node.op, right=right)
+
+            elif isinstance(node.op, ast.FloorDiv):
+                return ast.BinOp(left=left, op=node.op, right=right)
+
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            operand = simplify(node.operand)
+            if isinstance(operand, ast.Constant):
+                return ast.Constant(value=-operand.value)
+            return ast.UnaryOp(op=node.op, operand=operand)
+        elif isinstance(node, ast.Constant) or isinstance(node, ast.Name):
+            return node
+        elif isinstance(node, ast.Expression):
+            return simplify(node.body)
+        else:
+            return node
+
+    def flatten_add_sub(node):
+        result = []
+
+        def helper(n, sign=1):
+            if isinstance(n, ast.BinOp):
+                if isinstance(n.op, ast.Add):
+                    helper(n.left, sign)
+                    helper(n.right, sign)
+                elif isinstance(n.op, ast.Sub):
+                    helper(n.left, sign)
+                    helper(n.right, -sign)
+                else:
+                    result.append((sign, simplify(n)))
+            else:
+                result.append((sign, simplify(n)))
+
+        helper(node)
+        return result
+
+    def combine_constants(terms):
+        const_sum = 0
+        new_terms = []
+        for sign, term in terms:
+            if isinstance(term, ast.Constant):
+                const_sum += sign * term.value
+            else:
+                new_terms.append((sign, term))
+        if const_sum != 0:
+            new_terms.append((1, ast.Constant(value=const_sum)))
+        return new_terms
+
+    def rebuild_ast_from_terms(terms):
+        if not terms:
+            return ast.Constant(value=0)
+        node = None
+        for sign, term in terms:
+            if sign == -1:
+                term = ast.UnaryOp(op=ast.USub(), operand=term)
+            if node is None:
+                node = term
+            else:
+                node = ast.BinOp(left=node, op=ast.Add(), right=term)
+        return node
+
+    def clean_unary_minus(s):
+        return s.replace("+ -", "- ")
+
+    simplified_tree = simplify(tree)
+    result = ast.unparse(simplified_tree)
+    return clean_unary_minus(result)
