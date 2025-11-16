@@ -30,6 +30,24 @@ CACHE_DIR = pathlib.Path.home() / ".ninetoothed"
 CACHE_DIR.mkdir(exist_ok=True)
 
 
+def _log_debug(message, log_file=None):
+    """记录调试日志到文件。
+    
+    :param message: 要记录的日志消息
+    :param log_file: 日志文件路径，如果为 None 则使用默认路径
+    """
+    if log_file is None:
+        log_file = CACHE_DIR / "generation_debug.log"
+    
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        # 如果日志写入失败，静默忽略，避免影响主流程
+        pass
+
 class CodeGenerator(ast.NodeTransformer):
     def __init__(self):
         super().__init__()
@@ -57,6 +75,19 @@ class CodeGenerator(ast.NodeTransformer):
         self._min_num_elements = 2**log2_min_num_elements
 
         self._max_num_elements = 2**log2_max_num_elements
+
+        # NOTE
+        # 获取设备的共享内存限制
+        try:
+            device = triton.runtime.driver.active.get_current_device()
+            properties = triton.runtime.driver.active.utils.get_device_properties(device)
+            self._max_shared_mem = properties["max_shared_mem"]
+        except Exception:
+            # 如果无法获取，使用保守的默认值（48KB，这是大多数 GPU 的最小值）
+            self._max_shared_mem = 48 * 1024
+        
+        # 保留一些共享内存给其他用途（如寄存器溢出等），使用 80% 作为可用限制
+        self._available_shared_mem = int(self._max_shared_mem * 0.8)
 
     def __call__(
         self,
@@ -359,7 +390,80 @@ class CodeGenerator(ast.NodeTransformer):
     def _in_context(self, node):
         return isinstance(node, ast.Name) and node.id in self._context
 
+    # NOTE
+    def _estimate_shared_memory_usage(self, config):
+        """估算给定配置下的共享内存使用量（字节）。
+        
+        :param config: 包含 block_size 配置的字典
+        :return: 估算的共享内存使用量（字节）
+        """
+        _log_debug(f"_estimate_shared_memory_usage: 开始估算，config={config}")
+        
+        total_memory = 0
+        
+        # 估算每个 tensor 的内存需求
+        # for arg in self._args:
+        for arg_idx, arg in enumerate(self._args):
+            if arg.ndim == 0:
+                _log_debug(f"  arg[{arg_idx}]: ndim=0, 跳过")
+                continue
+            
+            # 获取最内层 tensor 的形状
+            innermost = arg.innermost()
+            
+            # 计算元素数量（用配置替换符号）
+            try:
+                shape_expr = math.prod(innermost.shape)
+                shape_str = str(shape_expr)
+                _log_debug(f"  arg[{arg_idx}]: 原始 shape_str={shape_str}")
+                
+                # 替换配置中的 block_size 符号
+                for param, value in config.items():
+                    shape_str = shape_str.replace(param, str(value))
+                _log_debug(f"  arg[{arg_idx}]: 替换后 shape_str={shape_str}")
+                
+                # 简化表达式并计算
+                num_elements = sympy.simplify(shape_str)
+                _log_debug(f"  arg[{arg_idx}]: 简化后 num_elements={num_elements} (type={type(num_elements)})")
+                
+                # 如果仍然包含符号，使用上界估算
+                if isinstance(num_elements, sympy.Symbol) or num_elements.has(sympy.Symbol):
+                    # 使用上界进行保守估算
+                    for free_symbol in num_elements.free_symbols:
+                        symbol_str = str(free_symbol)
+                        if symbol_str in self._symbols:
+                            symbol = self._symbols[symbol_str]
+                            num_elements = num_elements.subs(free_symbol, symbol.upper_bound)
+                            _log_debug(f"  arg[{arg_idx}]: 替换符号 {symbol_str} -> {symbol.upper_bound}")
+                
+                # 转换为数值
+                if isinstance(num_elements, (int, float)):
+                    num_elements = int(num_elements)
+                else:
+                    # 如果无法计算，使用上界估算
+                    num_elements = int(sympy.N(num_elements))
+                
+                _log_debug(f"  arg[{arg_idx}]: 最终 num_elements={num_elements}")
+                
+                # 假设每个元素是 float32（4 字节）
+                # 对于其他类型，需要从 tensor 的 dtype 获取，这里简化处理
+                element_size = 4  # float32
+                tensor_memory = num_elements * element_size
+                _log_debug(f"  arg[{arg_idx}]: tensor_memory={tensor_memory} bytes (num_elements={num_elements} * element_size={element_size})")
+                
+                total_memory += tensor_memory
+                
+            except Exception as e:
+                # 如果计算失败，跳过这个 tensor
+                _log_debug(f"  arg[{arg_idx}]: 计算失败，异常={type(e).__name__}: {e}")
+                continue
+        
+        return total_memory
+
     def _generate_autotune(self, params, meta):
+        _log_debug(f"_generate_autotune: 开始生成，params={params}, meta={meta}")
+        _log_debug(f"_generate_autotune: _max_shared_mem={self._max_shared_mem} bytes, _available_shared_mem={self._available_shared_mem} bytes")
+        
         inequalities = True
 
         for arg in self._args:
@@ -384,6 +488,7 @@ class CodeGenerator(ast.NodeTransformer):
                 values = tuple(values)
 
             values_of_meta_params.append(values)
+            _log_debug(f"  meta param '{param}': values={values} (lower={symbol.lower_bound}, upper={symbol.upper_bound}, power_of_two={symbol.power_of_two})")
 
         max_values_of_non_meta_params = {}
 
@@ -399,13 +504,46 @@ class CodeGenerator(ast.NodeTransformer):
 
         block_size_configs = []
 
+        block_size_memory_cache = {}
+        total_configs_checked = 0
+        total_configs_passed_inequalities = 0
+        total_configs_passed_memory = 0
+        total_configs_failed_memory = 0
+
         for values in itertools.product(*values_of_meta_params):
             config = {param: value for param, value in zip(meta, values)}
+            total_configs_checked += 1
 
             if sympy.logic.simplify_logic(
                 inequalities.subs(config | max_values_of_non_meta_params)
             ):
-                block_size_configs.append(config)
+                total_configs_passed_inequalities += 1
+                # NOTE
+                # 添加共享内存检查
+                try:
+                    shared_mem_usage = self._estimate_shared_memory_usage(config)
+                    cache_key = tuple(sorted(config.items()))
+                    _log_debug(f"  配置检查: config={config}, shared_mem_usage={shared_mem_usage} bytes, cache_key={cache_key}")
+                    
+                    if shared_mem_usage <= self._available_shared_mem:
+                        block_size_configs.append(config)
+                        block_size_memory_cache[cache_key] = shared_mem_usage
+                        total_configs_passed_memory += 1
+                        _log_debug(f"    -> 通过内存检查，已添加到 block_size_configs (当前总数={len(block_size_configs)})")
+                    else:
+                        total_configs_failed_memory += 1
+                        _log_debug(f"    -> 内存超限，已过滤 (shared_mem_usage={shared_mem_usage} > _available_shared_mem={self._available_shared_mem})")
+                except Exception as e:
+                    _log_debug(f"    -> 估算异常: {type(e).__name__}: {e}")
+                    continue
+
+        _log_debug(f"_generate_autotune: 配置生成统计:")
+        _log_debug(f"  总配置数: {total_configs_checked}")
+        _log_debug(f"  通过不等式检查: {total_configs_passed_inequalities}")
+        _log_debug(f"  通过内存检查: {total_configs_passed_memory}")
+        _log_debug(f"  内存超限: {total_configs_failed_memory}")
+        _log_debug(f"  最终 block_size_configs 数量: {len(block_size_configs)}")
+        _log_debug(f"  缓存大小: {len(block_size_memory_cache)}")
 
         if not block_size_configs:
             if meta:
@@ -431,6 +569,7 @@ class CodeGenerator(ast.NodeTransformer):
                 num_warps_configs, num_stages_configs
             )
         )
+        _log_debug(f"_generate_autotune: compiler_configs 数量: {len(compiler_configs)}")
 
         configs = [
             ast.Call(
@@ -466,16 +605,70 @@ class CodeGenerator(ast.NodeTransformer):
                 block_size_configs, compiler_configs
             )
         ]
+        _log_debug(f"_generate_autotune: 完整 configs 数量: {len(configs)}")
 
+        # NOTE
+        # 在采样之前，按共享内存使用量排序（优先选择内存需求小的配置）
         if self._max_num_configs is not None and len(configs) > self._max_num_configs:
-            configs = [
-                configs[i * len(configs) // self._max_num_configs]
-                for i in range(self._max_num_configs)
-            ]
+            _log_debug(f"_generate_autotune: 开始采样，max_num_configs={self._max_num_configs}, 当前 configs 数量={len(configs)}")
+            
+            # 提取配置并估算内存使用量
+            config_with_memory = []
+            cache_hits = 0
+            cache_misses = 0
+            
+            for config_idx, config_ast in enumerate(configs):
+                try:
+                    block_size_dict = {}
+
+                    # 从 AST 中提取 block_size 配置
+                    if config_ast.args and isinstance(config_ast.args[0], ast.Dict):
+                        for key, value in zip(config_ast.args[0].keys, config_ast.args[0].values):
+                            if isinstance(key, ast.Constant) and isinstance(value, ast.Constant):
+                                block_size_dict[key.value] = value.value
+                    
+                    cache_key = tuple(sorted(block_size_dict.items()))
+                    memory = block_size_memory_cache.get(cache_key)
+                    
+                    if memory is None:
+                        memory = self._estimate_shared_memory_usage(block_size_dict)
+                        _log_debug(f"  采样阶段 config[{config_idx}]: cache_miss, block_size_dict={block_size_dict}, cache_key={cache_key}, memory={memory}")
+                        cache_misses += 1
+                    else:
+                        _log_debug(f"  采样阶段 config[{config_idx}]: cache_hit, block_size_dict={block_size_dict}, cache_key={cache_key}, memory={memory}")
+                        cache_hits += 1
+
+                    config_with_memory.append((memory, config_ast))
+                except Exception as e:
+                    # 如果估算失败，使用一个很大的值
+                    _log_debug(f"  采样阶段 config[{config_idx}]: 提取/估算失败，异常={type(e).__name__}: {e}")
+                    config_with_memory.append((float('inf'), config_ast))
+            
+            _log_debug(f"_generate_autotune: 采样阶段统计: cache_hits={cache_hits}, cache_misses={cache_misses}")
+            
+            # 按内存使用量排序
+            config_with_memory.sort(key=lambda x: x[0])
+            _log_debug(f"_generate_autotune: 排序完成，前5个配置的内存使用量: {[x[0] for x in config_with_memory[:5]]}")
+            
+            # 均匀采样，但优先选择内存需求小的
+            step = len(config_with_memory) // self._max_num_configs
+            _log_debug(f"_generate_autotune: 采样 step={step}")
+            
+            sampled_indices = []
+            configs = []
+            for i in range(self._max_num_configs):
+                idx = i * step
+                sampled_indices.append(idx)
+                configs.append(config_with_memory[idx][1])
+                _log_debug(f"  采样索引[{i}]: 选择 config_with_memory[{idx}], memory={config_with_memory[idx][0]} bytes")
+            
+            _log_debug(f"_generate_autotune: 采样完成，最终选择 {len(configs)} 个配置，采样索引={sampled_indices}")
 
         if len(configs) <= 1:
+            _log_debug(f"_generate_autotune: 配置数量 <= 1，返回 None")
             return None
-
+        _log_debug(f"_generate_autotune: 完成，最终返回 {len(configs)} 个配置")
+        
         return ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id="ninetoothed", ctx=ast.Load()),
