@@ -12,7 +12,18 @@ Meta-Operations
 
    ninetoothed.Tensor.tile
    ninetoothed.Tensor.expand
+   ninetoothed.Tensor.unsqueeze
    ninetoothed.Tensor.squeeze
    ninetoothed.Tensor.permute
    ninetoothed.Tensor.flatten
    ninetoothed.Tensor.ravel
+
+Evaluation
+----------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   ninetoothed.Tensor.eval
+   ninetoothed.Tensor.subs
